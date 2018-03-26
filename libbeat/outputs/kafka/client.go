@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/elastic/beats/libbeat/common/fmtstr"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/monitoring"
 	"github.com/elastic/beats/libbeat/outputs"
 	"github.com/elastic/beats/libbeat/outputs/codec"
 	"github.com/elastic/beats/libbeat/outputs/outil"
@@ -17,12 +17,13 @@ import (
 )
 
 type client struct {
-	hosts  []string
-	topic  outil.Selector
-	key    *fmtstr.EventFormatString
-	index  string
-	codec  codec.Codec
-	config sarama.Config
+	observer outputs.Observer
+	hosts    []string
+	topic    outil.Selector
+	key      *fmtstr.EventFormatString
+	index    string
+	codec    codec.Codec
+	config   sarama.Config
 
 	producer sarama.AsyncProducer
 
@@ -30,6 +31,7 @@ type client struct {
 }
 
 type msgRef struct {
+	client *client
 	count  int32
 	total  int
 	failed []publisher.Event
@@ -39,14 +41,11 @@ type msgRef struct {
 }
 
 var (
-	kafkaMetrics = outputs.Metrics.NewRegistry("kafka")
-
-	ackedEvents            = monitoring.NewInt(kafkaMetrics, "events.acked")
-	eventsNotAcked         = monitoring.NewInt(kafkaMetrics, "events.not_acked")
-	publishEventsCallCount = monitoring.NewInt(kafkaMetrics, "publishEvents.call.count")
+	errNoTopicsSelected = errors.New("no topic could be selected")
 )
 
 func newKafkaClient(
+	observer outputs.Observer,
 	hosts []string,
 	index string,
 	key *fmtstr.EventFormatString,
@@ -55,12 +54,13 @@ func newKafkaClient(
 	cfg *sarama.Config,
 ) (*client, error) {
 	c := &client{
-		hosts:  hosts,
-		topic:  topic,
-		key:    key,
-		index:  index,
-		codec:  writer,
-		config: *cfg,
+		observer: observer,
+		hosts:    hosts,
+		topic:    topic,
+		key:      key,
+		index:    index,
+		codec:    writer,
+		config:   *cfg,
 	}
 	return c, nil
 }
@@ -94,12 +94,11 @@ func (c *client) Close() error {
 }
 
 func (c *client) Publish(batch publisher.Batch) error {
-	publishEventsCallCount.Add(1)
-	debugf("publish events")
-
 	events := batch.Events()
+	c.observer.NewBatch(len(events))
 
 	ref := &msgRef{
+		client: c,
 		count:  int32(len(events)),
 		total:  len(events),
 		failed: nil,
@@ -113,6 +112,7 @@ func (c *client) Publish(batch publisher.Batch) error {
 		if err != nil {
 			logp.Err("Dropping event: %v", err)
 			ref.done()
+			c.observer.Dropped(1)
 			continue
 		}
 
@@ -144,6 +144,9 @@ func (c *client) getEventMessage(data *publisher.Event) (*message, error) {
 		topic, err := c.topic.Select(event)
 		if err != nil {
 			return nil, fmt.Errorf("setting kafka topic failed with %v", err)
+		}
+		if topic == "" {
+			return nil, errNoTopicsSelected
 		}
 		msg.topic = topic
 		if event.Meta == nil {
@@ -223,6 +226,7 @@ func (r *msgRef) dec() {
 	}
 
 	debugf("finished kafka batch")
+	stats := r.client.observer
 
 	err := r.err
 	if err != nil {
@@ -230,17 +234,14 @@ func (r *msgRef) dec() {
 		success := r.total - failed
 		r.batch.RetryEvents(r.failed)
 
-		eventsNotAcked.Add(int64(failed))
+		stats.Failed(failed)
 		if success > 0 {
-			ackedEvents.Add(int64(success))
-			outputs.AckedEvents.Add(int64(success))
+			stats.Acked(success)
 		}
 
 		debugf("Kafka publish failed with: %v", err)
 	} else {
 		r.batch.ACK()
-
-		ackedEvents.Add(int64(r.total))
-		outputs.AckedEvents.Add(int64(r.total))
+		stats.Acked(r.total)
 	}
 }

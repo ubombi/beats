@@ -4,16 +4,7 @@
 package outputs
 
 import (
-	"github.com/elastic/beats/libbeat/monitoring"
 	"github.com/elastic/beats/libbeat/publisher"
-)
-
-var (
-	Metrics = monitoring.Default.NewRegistry("output")
-
-	AckedEvents = monitoring.NewInt(Metrics, "events.acked", monitoring.Report)
-	WriteBytes  = monitoring.NewInt(Metrics, "write.bytes", monitoring.Report)
-	WriteErrors = monitoring.NewInt(Metrics, "write.errors", monitoring.Report)
 )
 
 // Client provides the minimal interface an output must implement to be usable
@@ -29,7 +20,7 @@ type Client interface {
 	Publish(publisher.Batch) error
 }
 
-// NetworkClient defines the required client capabilites for network based
+// NetworkClient defines the required client capabilities for network based
 // outputs, that must be reconnectable.
 type NetworkClient interface {
 	Client

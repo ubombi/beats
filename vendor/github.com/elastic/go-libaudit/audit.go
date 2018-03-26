@@ -43,6 +43,12 @@ const (
 	AuditSet
 )
 
+// Netlink groups.
+const (
+	NetlinkGroupNone    = iota // Group 0 not used
+	NetlinkGroupReadLog        // "best effort" read only socket
+)
+
 // WaitMode is a flag to control the behavior of methods that abstract
 // asynchronous communication for the caller.
 type WaitMode uint8
@@ -69,16 +75,32 @@ const (
 // AuditClient is a client for communicating with the Linux kernels audit
 // interface over netlink.
 type AuditClient struct {
-	Netlink NetlinkSendReceiver
+	Netlink         NetlinkSendReceiver
+	pendingAcks     []uint32
+	clearPIDOnClose bool
+}
+
+// NewMulticastAuditClient creates a new AuditClient that binds to the multicast
+// socket subscribes to the audit group. The process should have the
+// CAP_AUDIT_READ capability to use this. This audit client should not be used
+// for command and control. The resp parameter is optional. If provided resp
+// will receive a copy of all data read from the netlink socket. This is useful
+// for debugging purposes.
+func NewMulticastAuditClient(resp io.Writer) (*AuditClient, error) {
+	return newAuditClient(NetlinkGroupReadLog, resp)
 }
 
 // NewAuditClient creates a new AuditClient. The resp parameter is optional. If
 // provided resp will receive a copy of all data read from the netlink socket.
 // This is useful for debugging purposes.
 func NewAuditClient(resp io.Writer) (*AuditClient, error) {
+	return newAuditClient(NetlinkGroupNone, resp)
+}
+
+func newAuditClient(netlinkGroups uint32, resp io.Writer) (*AuditClient, error) {
 	buf := make([]byte, syscall.NLMSG_HDRLEN+AuditMessageMaxLength)
 
-	netlink, err := NewNetlinkClient(syscall.NETLINK_AUDIT, buf, resp)
+	netlink, err := NewNetlinkClient(syscall.NETLINK_AUDIT, netlinkGroups, buf, resp)
 	if err != nil {
 		return nil, err
 	}
@@ -271,6 +293,7 @@ func (c *AuditClient) SetPID(wm WaitMode) error {
 		Mask: AuditStatusPID,
 		PID:  uint32(os.Getpid()),
 	}
+	c.clearPIDOnClose = true
 	return c.set(status, wm)
 }
 
@@ -349,39 +372,69 @@ func (c *AuditClient) Receive(nonBlocking bool) (*RawAuditMessage, error) {
 
 // Close closes the AuditClient and frees any associated resources.
 func (c *AuditClient) Close() error {
+	// Unregister from the kernel for a clean exit.
+	status := AuditStatus{
+		Mask: AuditStatusPID,
+		PID:  0,
+	}
+	c.set(status, NoWait)
+
 	return c.Netlink.Close()
+}
+
+// WaitForPendingACKs waits for acknowledgements messages for operations
+// executed with a WaitMode of NoWait. Such ACK messages are expected in the
+// same order as the operations have been performed. If it receives an error,
+// it is returned and no further ACKs are processed.
+func (c *AuditClient) WaitForPendingACKs() error {
+	for _, reqId := range c.pendingAcks {
+		ack, err := c.getReply(reqId)
+		if err != nil {
+			return err
+		}
+		if ack.Header.Type != syscall.NLMSG_ERROR {
+			return errors.Errorf("unexpected ACK to SET, type=%d", ack.Header.Type)
+		}
+		if err := ParseNetlinkError(ack.Data); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // getReply reads from the netlink socket and find the message with the given
 // sequence number. The caller should inspect the returned message's type,
 // flags, and error code.
 func (c *AuditClient) getReply(seq uint32) (*syscall.NetlinkMessage, error) {
+	var msg syscall.NetlinkMessage
 	var msgs []syscall.NetlinkMessage
 	var err error
 
-	// Retry the non-blocking read multiple times until a response is received.
-	for i := 0; i < 10; i++ {
-		msgs, err = c.Netlink.Receive(true, parseNetlinkAuditMessage)
-		if err != nil {
-			switch err {
-			case syscall.EINTR:
-				continue
-			case syscall.EAGAIN:
-				time.Sleep(50 * time.Millisecond)
-				continue
-			default:
-				return nil, errors.Wrap(err, "error receiving audit reply")
+	for receiveMore := true; receiveMore; {
+		// Retry the non-blocking read multiple times until a response is received.
+		for i := 0; i < 10; i++ {
+			msgs, err = c.Netlink.Receive(true, parseNetlinkAuditMessage)
+			if err != nil {
+				switch err {
+				case syscall.EINTR:
+					continue
+				case syscall.EAGAIN:
+					time.Sleep(50 * time.Millisecond)
+					continue
+				default:
+					return nil, errors.Wrap(err, "error receiving audit reply")
+				}
 			}
+			break
 		}
 
-		break
+		if len(msgs) == 0 {
+			return nil, errors.New("no reply received")
+		}
+		msg = msgs[0]
+		// Skip audit event that sneak between the request/response
+		receiveMore = msg.Header.Seq == 0 && seq != 0
 	}
-
-	if len(msgs) == 0 {
-		return nil, errors.New("no reply received")
-	}
-	msg := msgs[0]
-
 	if msg.Header.Seq != seq {
 		return nil, errors.Errorf("unexpected sequence number for reply (expected %v but got %v)",
 			seq, msg.Header.Seq)
@@ -404,6 +457,7 @@ func (c *AuditClient) set(status AuditStatus, mode WaitMode) error {
 	}
 
 	if mode == NoWait {
+		c.storePendingAck(seq)
 		return nil
 	}
 
@@ -520,4 +574,8 @@ func (s *AuditStatus) fromWireFormat(buf []byte) error {
 	}
 
 	return nil
+}
+
+func (c *AuditClient) storePendingAck(requestID uint32) {
+	c.pendingAcks = append(c.pendingAcks, requestID)
 }

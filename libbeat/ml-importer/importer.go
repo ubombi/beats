@@ -4,11 +4,24 @@ package mlimporter
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net/url"
+	"strings"
+
+	"github.com/joeshaw/multierror"
+	"github.com/pkg/errors"
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/pkg/errors"
+)
+
+var (
+	esDataFeedURL        = "/_xpack/ml/datafeeds/datafeed-%s"
+	esJobURL             = "/_xpack/ml/anomaly_detectors/%s"
+	kibanaGetModuleURL   = "/api/ml/modules/get_module/%s"
+	kibanaRecognizeURL   = "/api/ml/modules/recognize/%s"
+	kibanaSetupModuleURL = "/api/ml/modules/setup/%s"
 )
 
 // MLConfig contains the required configuration for loading one job and the associated
@@ -17,6 +30,7 @@ type MLConfig struct {
 	ID           string `config:"id"`
 	JobPath      string `config:"job"`
 	DatafeedPath string `config:"datafeed"`
+	MinVersion   string `config:"min_version"`
 }
 
 // MLLoader is a subset of the Elasticsearch client API capable of
@@ -24,6 +38,57 @@ type MLConfig struct {
 type MLLoader interface {
 	Request(method, path string, pipeline string, params map[string]string, body interface{}) (int, []byte, error)
 	LoadJSON(path string, json map[string]interface{}) ([]byte, error)
+	GetVersion() string
+}
+
+// MLSetupper is a subset of the Kibana client API capable of setting up ML objects.
+type MLSetupper interface {
+	Request(method, path string, params url.Values, body io.Reader) (int, []byte, error)
+	GetVersion() string
+}
+
+// MLResponse stores the relevant parts of the response from Kibana to check for errors.
+type MLResponse struct {
+	Datafeeds []struct {
+		ID      string
+		Success bool
+		Error   struct {
+			Msg string
+		}
+	}
+	Jobs []struct {
+		ID      string
+		Success bool
+		Error   struct {
+			Msg string
+		}
+	}
+	Kibana struct {
+		Dashboard []struct {
+			Success bool
+			ID      string
+			Exists  bool
+			Error   struct {
+				Message string
+			}
+		}
+		Search []struct {
+			Success bool
+			ID      string
+			Exists  bool
+			Error   struct {
+				Message string
+			}
+		}
+		Visualization []struct {
+			Success bool
+			ID      string
+			Exists  bool
+			Error   struct {
+				Message string
+			}
+		}
+	}
 }
 
 func readJSONFile(path string) (common.MapStr, error) {
@@ -38,8 +103,25 @@ func readJSONFile(path string) (common.MapStr, error) {
 
 // ImportMachineLearningJob uploads the job and datafeed configuration to ES/xpack.
 func ImportMachineLearningJob(esClient MLLoader, cfg *MLConfig) error {
-	jobURL := fmt.Sprintf("/_xpack/ml/anomaly_detectors/%s", cfg.ID)
-	datafeedURL := fmt.Sprintf("/_xpack/ml/datafeeds/datafeed-%s", cfg.ID)
+	jobURL := fmt.Sprintf(esJobURL, cfg.ID)
+	datafeedURL := fmt.Sprintf(esDataFeedURL, cfg.ID)
+
+	if len(cfg.MinVersion) > 0 {
+		esVersion, err := common.NewVersion(esClient.GetVersion())
+		if err != nil {
+			return errors.Errorf("Error parsing ES version: %s: %v", esClient.GetVersion(), err)
+		}
+		minVersion, err := common.NewVersion(cfg.MinVersion)
+		if err != nil {
+			return errors.Errorf("Error parsing min_version: %s: %v", minVersion, err)
+		}
+
+		if esVersion.LessThan(minVersion) {
+			logp.Debug("machine-learning", "Skipping job %s, because ES version (%s) is smaller than min version (%s)",
+				cfg.ID, esVersion, minVersion)
+			return nil
+		}
+	}
 
 	// We always overwrite ML job configs, so delete them before loading
 	status, response, err := esClient.Request("GET", jobURL, "", nil, nil)
@@ -78,9 +160,8 @@ func ImportMachineLearningJob(esClient MLLoader, cfg *MLConfig) error {
 
 // HaveXpackML checks whether X-pack is installed and has Machine Learning enabled.
 func HaveXpackML(esClient MLLoader) (bool, error) {
-
 	status, response, err := esClient.Request("GET", "/_xpack", "", nil, nil)
-	if status == 404 {
+	if status == 404 || status == 400 {
 		return false, nil
 	}
 	if err != nil {
@@ -101,4 +182,83 @@ func HaveXpackML(esClient MLLoader) (bool, error) {
 		return false, errors.Wrap(err, "unmarshal")
 	}
 	return xpack.Features.ML.Available && xpack.Features.ML.Enabled, nil
+}
+
+// SetupModule creates ML jobs, data feeds and dashboards for modules.
+func SetupModule(kibanaClient MLSetupper, module, prefix string) error {
+	setupURL := fmt.Sprintf(kibanaSetupModuleURL, module)
+	prefixPayload := fmt.Sprintf("{\"prefix\": \"%s\"}", prefix)
+	status, response, err := kibanaClient.Request("POST", setupURL, nil, strings.NewReader(prefixPayload))
+	if status != 200 {
+		return errors.Errorf("cannot set up ML with prefix: %s", prefix)
+	}
+	if err != nil {
+		return err
+	}
+
+	return checkResponse(response)
+}
+
+func checkResponse(r []byte) error {
+	var errs multierror.Errors
+
+	var resp MLResponse
+	err := json.Unmarshal(r, &resp)
+	if err != nil {
+		return err
+	}
+
+	for _, feed := range resp.Datafeeds {
+		if !feed.Success {
+			if strings.HasPrefix(feed.Error.Msg, "[resource_already_exists_exception]") {
+				logp.Debug("machine-learning", "Datafeed already exists: %s", feed.ID)
+				continue
+			}
+			errs = append(errs, errors.Errorf(feed.Error.Msg))
+		}
+	}
+	for _, job := range resp.Jobs {
+		if strings.HasPrefix(job.Error.Msg, "[resource_already_exists_exception]") {
+			logp.Debug("machine-learning", "Job already exists: %s", job.ID)
+			continue
+		}
+		if !job.Success {
+			errs = append(errs, errors.Errorf(job.Error.Msg))
+		}
+	}
+	for _, dashboard := range resp.Kibana.Dashboard {
+		if !dashboard.Success {
+			if dashboard.Exists {
+				logp.Debug("machine-learning", "Dashboard already exists: %s", dashboard.ID)
+			} else if strings.Contains(dashboard.Error.Message, "version conflict, document already exists") {
+				continue
+			} else {
+				errs = append(errs, errors.Errorf("error while setting up dashboard: %s", dashboard.ID))
+			}
+		}
+	}
+	for _, search := range resp.Kibana.Search {
+		if !search.Success {
+			if search.Exists {
+				logp.Debug("machine-learning", "Search already exists: %s", search.ID)
+			} else if strings.Contains(search.Error.Message, "version conflict, document already exists") {
+				continue
+			} else {
+				errs = append(errs, errors.Errorf("error while setting up search: %s", search.ID))
+			}
+		}
+	}
+	for _, visualization := range resp.Kibana.Visualization {
+		if !visualization.Success {
+			if visualization.Exists {
+				logp.Debug("machine-learning", "Visualization already exists: %s", visualization.ID)
+			} else if strings.Contains(visualization.Error.Message, "version conflict, document already exists") {
+				continue
+			} else {
+				errs = append(errs, errors.Errorf("error while setting up visualization: %s", visualization.ID))
+			}
+		}
+	}
+
+	return errs.Err()
 }

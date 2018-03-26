@@ -3,16 +3,18 @@ package pipeline
 import (
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/outputs"
-	"github.com/elastic/beats/libbeat/publisher/broker"
+	"github.com/elastic/beats/libbeat/publisher/queue"
 )
 
-// outputController manages the pipelines output capabilites, like:
+// outputController manages the pipelines output capabilities, like:
 // - start
 // - stop
 // - reload
 type outputController struct {
-	logger *logp.Logger
-	broker broker.Broker
+	logger   *logp.Logger
+	observer outputObserver
+
+	queue queue.Queue
 
 	retryer  *retryer
 	consumer *eventConsumer
@@ -38,16 +40,19 @@ type outputWorker interface {
 
 func newOutputController(
 	log *logp.Logger,
-	b broker.Broker,
+	observer outputObserver,
+	b queue.Queue,
 ) *outputController {
 	c := &outputController{
-		logger: log,
-		broker: b,
+		logger:   log,
+		observer: observer,
+		queue:    b,
 	}
 
 	ctx := &batchContext{}
 	c.consumer = newEventConsumer(log, b, ctx)
-	c.retryer = newRetryer(log, nil, c.consumer)
+	c.retryer = newRetryer(log, observer, nil, c.consumer)
+	ctx.observer = observer
 	ctx.retryer = c.retryer
 
 	c.consumer.sigContinue()
@@ -77,7 +82,7 @@ func (c *outputController) Set(outGrp outputs.Group) {
 	queue := makeWorkQueue()
 	worker := make([]outputWorker, len(clients))
 	for i, client := range clients {
-		worker[i] = makeClientWorker(queue, client)
+		worker[i] = makeClientWorker(c.observer, queue, client)
 	}
 	grp := &outputGroup{
 		workQueue:  queue,
@@ -108,6 +113,8 @@ func (c *outputController) Set(outGrp outputs.Group) {
 
 	// restart consumer (potentially blocked by retryer)
 	c.consumer.sigContinue()
+
+	c.observer.updateOutputGroup()
 }
 
 func makeWorkQueue() workQueue {

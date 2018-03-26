@@ -3,11 +3,10 @@ package format
 import (
 	"errors"
 
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/common/fmtstr"
-	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/outputs/codec"
-	"github.com/elastic/beats/libbeat/publisher/beat"
 )
 
 type Encoder struct {
@@ -19,7 +18,7 @@ type Config struct {
 }
 
 func init() {
-	codec.RegisterType("format", func(cfg *common.Config) (codec.Codec, error) {
+	codec.RegisterType("format", func(_ beat.Info, cfg *common.Config) (codec.Codec, error) {
 		config := Config{}
 		if cfg == nil {
 			return nil, errors.New("empty format codec configuration")
@@ -38,9 +37,5 @@ func New(fmt *fmtstr.EventFormatString) *Encoder {
 }
 
 func (e *Encoder) Encode(_ string, event *beat.Event) ([]byte, error) {
-	serializedEvent, err := e.Format.RunBytes(event)
-	if err != nil {
-		logp.Err("Fail to format event (%v): %#v", err, event)
-	}
-	return serializedEvent, err
+	return e.Format.RunBytes(event)
 }

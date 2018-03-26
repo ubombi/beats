@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
 	"github.com/elastic/beats/libbeat/monitoring"
@@ -16,9 +17,9 @@ import (
 	esout "github.com/elastic/beats/libbeat/outputs/elasticsearch"
 	"github.com/elastic/beats/libbeat/outputs/outil"
 	"github.com/elastic/beats/libbeat/outputs/transport"
-	"github.com/elastic/beats/libbeat/publisher/beat"
-	"github.com/elastic/beats/libbeat/publisher/broker/membroker"
 	"github.com/elastic/beats/libbeat/publisher/pipeline"
+	"github.com/elastic/beats/libbeat/publisher/queue"
+	"github.com/elastic/beats/libbeat/publisher/queue/memqueue"
 )
 
 type reporter struct {
@@ -44,20 +45,20 @@ var errNoMonitoring = errors.New("xpack monitoring not available")
 // default monitoring api parameters
 var defaultParams = map[string]string{
 	"system_id":          "beats",
-	"system_api_version": "2",
+	"system_api_version": "6",
 }
 
 func init() {
 	report.RegisterReporterFactory("elasticsearch", makeReporter)
 }
 
-func makeReporter(beat common.BeatInfo, cfg *common.Config) (report.Reporter, error) {
+func makeReporter(beat beat.Info, cfg *common.Config) (report.Reporter, error) {
 	config := defaultConfig
 	if err := cfg.Unpack(&config); err != nil {
 		return nil, err
 	}
 
-	// check endpoint availablity on startup only every 30 seconds
+	// check endpoint availability on startup only every 30 seconds
 	checkRetry := 30 * time.Second
 	windowSize := config.BulkMaxSize - 1
 	if windowSize <= 0 {
@@ -77,10 +78,10 @@ func makeReporter(beat common.BeatInfo, cfg *common.Config) (report.Reporter, er
 	}
 
 	params := map[string]string{}
-	for k, v := range config.Params {
+	for k, v := range defaultParams {
 		params[k] = v
 	}
-	for k, v := range defaultParams {
+	for k, v := range config.Params {
 		params[k] = v
 	}
 	params["interval"] = config.Period.String()
@@ -103,11 +104,23 @@ func makeReporter(beat common.BeatInfo, cfg *common.Config) (report.Reporter, er
 		out.Clients = append(out.Clients, client)
 	}
 
-	broker := membroker.NewBroker(20, false)
-	settings := pipeline.Settings{}
-	pipeline, err := pipeline.New(broker, nil, out, settings)
+	queueFactory := func(e queue.Eventer) (queue.Queue, error) {
+		return memqueue.NewBroker(memqueue.Settings{
+			Eventer: e,
+			Events:  20,
+		}), nil
+	}
+
+	monitoring := monitoring.Default.NewRegistry("xpack.monitoring")
+
+	pipeline, err := pipeline.New(
+		beat,
+		monitoring,
+		queueFactory, out, pipeline.Settings{
+			WaitClose:     0,
+			WaitCloseMode: pipeline.NoWaitOnClose,
+		})
 	if err != nil {
-		broker.Close()
 		return nil, err
 	}
 
@@ -148,6 +161,8 @@ func (r *reporter) initLoop() {
 		if err == nil {
 			closing(client)
 			break
+		} else {
+			logp.Err("Monitoring could not connect to elasticsearch, failed with %v", err)
 		}
 
 		select {
@@ -205,7 +220,7 @@ func makeClient(
 	tlsConfig *transport.TLSConfig,
 	config *config,
 ) (outputs.NetworkClient, error) {
-	url, err := esout.MakeURL(config.Protocol, "", host)
+	url, err := common.MakeURL(config.Protocol, "", host, 9200)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +267,7 @@ func parseProxyURL(raw string) (*url.URL, error) {
 	return url.Parse("http://" + raw)
 }
 
-func makeMeta(beat common.BeatInfo) common.MapStr {
+func makeMeta(beat beat.Info) common.MapStr {
 	return common.MapStr{
 		"type":    beat.Beat,
 		"version": beat.Version,
