@@ -3,10 +3,10 @@ package outil
 import (
 	"fmt"
 
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/common/fmtstr"
 	"github.com/elastic/beats/libbeat/processors"
-	"github.com/elastic/beats/libbeat/publisher/beat"
 )
 
 type Selector struct {
@@ -325,7 +325,7 @@ func (s *listSelector) sel(evt *beat.Event) (string, error) {
 }
 
 func (s *condSelector) sel(evt *beat.Event) (string, error) {
-	if !s.cond.Check(evt.Fields) {
+	if !s.cond.Check(evt) {
 		return "", nil
 	}
 	return s.s.sel(evt)

@@ -4,9 +4,9 @@ import (
 	"errors"
 	"time"
 
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/monitoring"
 	"github.com/elastic/beats/libbeat/outputs"
 	"github.com/elastic/beats/libbeat/outputs/codec"
 	"github.com/elastic/beats/libbeat/outputs/outil"
@@ -14,23 +14,10 @@ import (
 )
 
 type redisOut struct {
-	beat common.BeatInfo
+	beat beat.Info
 }
 
 var debugf = logp.MakeDebug("redis")
-
-// Metrics that can retrieved through the expvar web interface.
-var (
-	redisMetrics = outputs.Metrics.NewRegistry("redis")
-
-	ackedEvents    = monitoring.NewInt(redisMetrics, "events.acked")
-	eventsNotAcked = monitoring.NewInt(redisMetrics, "events.not_acked")
-
-	statReadBytes   = monitoring.NewInt(redisMetrics, "read.bytes")
-	statWriteBytes  = monitoring.NewInt(redisMetrics, "write.bytes")
-	statReadErrors  = monitoring.NewInt(redisMetrics, "read.errors")
-	statWriteErrors = monitoring.NewInt(redisMetrics, "write.errors")
-)
 
 const (
 	defaultWaitRetry    = 1 * time.Second
@@ -41,7 +28,11 @@ func init() {
 	outputs.RegisterType("redis", makeRedis)
 }
 
-func makeRedis(beat common.BeatInfo, cfg *common.Config) (outputs.Group, error) {
+func makeRedis(
+	beat beat.Info,
+	observer outputs.Observer,
+	cfg *common.Config,
+) (outputs.Group, error) {
 	config := defaultConfig
 	if err := cfg.Unpack(&config); err != nil {
 		return outputs.Fail(err)
@@ -98,19 +89,12 @@ func makeRedis(beat common.BeatInfo, cfg *common.Config) (outputs.Group, error) 
 		Timeout: config.Timeout,
 		Proxy:   &config.Proxy,
 		TLS:     tls,
-		Stats: &transport.IOStats{
-			Read:               statReadBytes,
-			Write:              statWriteBytes,
-			ReadErrors:         statReadErrors,
-			WriteErrors:        statWriteErrors,
-			OutputsWrite:       outputs.WriteBytes,
-			OutputsWriteErrors: outputs.WriteErrors,
-		},
+		Stats:   observer,
 	}
 
 	clients := make([]outputs.NetworkClient, len(hosts))
 	for i, host := range hosts {
-		enc, err := codec.CreateEncoder(config.Codec)
+		enc, err := codec.CreateEncoder(beat, config.Codec)
 		if err != nil {
 			return outputs.Fail(err)
 		}
@@ -120,7 +104,7 @@ func makeRedis(beat common.BeatInfo, cfg *common.Config) (outputs.Group, error) 
 			return outputs.Fail(err)
 		}
 
-		clients[i] = newClient(conn, config.Timeout,
+		clients[i] = newClient(conn, observer, config.Timeout,
 			config.Password, config.Db, key, dataType, config.Index, enc)
 	}
 

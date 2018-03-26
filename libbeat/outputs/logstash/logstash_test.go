@@ -2,7 +2,6 @@ package logstash
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"testing"
 	"time"
@@ -11,11 +10,11 @@ import (
 
 	"github.com/elastic/go-lumber/server/v2"
 
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/outputs"
 	"github.com/elastic/beats/libbeat/outputs/outest"
 	"github.com/elastic/beats/libbeat/outputs/transport/transptest"
-	"github.com/elastic/beats/libbeat/publisher/beat"
 )
 
 const (
@@ -41,10 +40,10 @@ func TestLogstashTLS(t *testing.T) {
 	enableLogging([]string{"*"})
 
 	certName := "ca_test"
-	ip := net.IP{127, 0, 0, 1}
+	ip := "127.0.0.1"
 
 	timeout := 2 * time.Second
-	transptest.GenCertsForIPIfMIssing(t, ip, certName)
+	transptest.GenCertForTestingPurpose(t, ip, certName, "")
 	server := transptest.NewMockServerTLS(t, timeout, certName, nil)
 
 	// create lumberjack output client
@@ -59,10 +58,10 @@ func TestLogstashTLS(t *testing.T) {
 
 func TestLogstashInvalidTLSInsecure(t *testing.T) {
 	certName := "ca_invalid_test"
-	ip := net.IP{1, 2, 3, 4}
+	ip := "1.2.3.4"
 
 	timeout := 2 * time.Second
-	transptest.GenCertsForIPIfMIssing(t, ip, certName)
+	transptest.GenCertForTestingPurpose(t, ip, certName, "")
 	server := transptest.NewMockServerTLS(t, timeout, certName, nil)
 
 	config := map[string]interface{}{
@@ -164,7 +163,7 @@ func newTestLumberjackOutput(
 	}
 
 	cfg, _ := common.NewConfigFrom(config)
-	grp, err := outputs.Load(common.BeatInfo{}, "logstash", cfg)
+	grp, err := outputs.Load(beat.Info{}, nil, "logstash", cfg)
 	if err != nil {
 		t.Fatalf("init logstash output plugin failed: %v", err)
 	}

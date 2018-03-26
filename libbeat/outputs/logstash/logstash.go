@@ -1,9 +1,9 @@
 package logstash
 
 import (
+	"github.com/elastic/beats/libbeat/beat"
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/elastic/beats/libbeat/logp"
-	"github.com/elastic/beats/libbeat/monitoring"
 	"github.com/elastic/beats/libbeat/outputs"
 	"github.com/elastic/beats/libbeat/outputs/transport"
 )
@@ -13,26 +13,17 @@ const (
 	defaultStartMaxWindowSize int = 10
 )
 
-var (
-	logstashMetrics = outputs.Metrics.NewRegistry("logstash")
-
-	ackedEvents            = monitoring.NewInt(logstashMetrics, "events.acked")
-	eventsNotAcked         = monitoring.NewInt(logstashMetrics, "events.not_acked")
-	publishEventsCallCount = monitoring.NewInt(logstashMetrics, "publishEvents.call.count")
-
-	statReadBytes   = monitoring.NewInt(logstashMetrics, "read.bytes")
-	statWriteBytes  = monitoring.NewInt(logstashMetrics, "write.bytes")
-	statReadErrors  = monitoring.NewInt(logstashMetrics, "read.errors")
-	statWriteErrors = monitoring.NewInt(logstashMetrics, "write.errors")
-)
-
 var debugf = logp.MakeDebug("logstash")
 
 func init() {
 	outputs.RegisterType("logstash", makeLogstash)
 }
 
-func makeLogstash(beat common.BeatInfo, cfg *common.Config) (outputs.Group, error) {
+func makeLogstash(
+	beat beat.Info,
+	observer outputs.Observer,
+	cfg *common.Config,
+) (outputs.Group, error) {
 	if !cfg.HasField("index") {
 		cfg.SetString("index", -1, beat.Beat)
 	}
@@ -56,14 +47,7 @@ func makeLogstash(beat common.BeatInfo, cfg *common.Config) (outputs.Group, erro
 		Timeout: config.Timeout,
 		Proxy:   &config.Proxy,
 		TLS:     tls,
-		Stats: &transport.IOStats{
-			Read:               statReadBytes,
-			Write:              statWriteBytes,
-			ReadErrors:         statReadErrors,
-			WriteErrors:        statWriteErrors,
-			OutputsWrite:       outputs.WriteBytes,
-			OutputsWriteErrors: outputs.WriteErrors,
-		},
+		Stats:   observer,
 	}
 
 	clients := make([]outputs.NetworkClient, len(hosts))
@@ -76,9 +60,9 @@ func makeLogstash(beat common.BeatInfo, cfg *common.Config) (outputs.Group, erro
 		}
 
 		if config.Pipelining > 0 {
-			client, err = newAsyncClient(conn, config)
+			client, err = newAsyncClient(beat, conn, observer, config)
 		} else {
-			client, err = newSyncClient(conn, config)
+			client, err = newSyncClient(beat, conn, observer, config)
 		}
 		if err != nil {
 			return outputs.Fail(err)
